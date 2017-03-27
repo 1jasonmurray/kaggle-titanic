@@ -1,0 +1,198 @@
+---
+title: "kaggle-titanic"
+author: "Jason Murray"
+date: '2016-12-10'
+output: html_document
+---
+
+##Summary  
+I'm new to kaggle and data anlytics in general.  This document covers my exploration of the titanic data for the kaggle challenge.  The goal is to build a model that will accurately predict survival for the test set of passengers based on learning from the training set.  
+<br>
+
+###Libraries
+```{r libraries, message=FALSE}
+library(mice)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(parallel)
+library(doParallel)
+```
+
+###Data download and load
+```{r downLoad}
+## Data was obtained from the kagggle challenge website
+## https://www.kaggle.com/c/titanic/
+
+##Train Data
+trainURL <- "https://kaggle2.blob.core.windows.net/competitions-data/kaggle/3136/train.csv?sv=2015-12-11&sr=b&sig=sR2hRdWWjjygbvaWj3dCbjqBPzjrJ4gAQulu3w1xw2M%3D&se=2016-12-14T00%3A56%3A01Z&sp=r"
+trainfile <- "./data/train.csv"
+
+##Test Data
+testURL <- "https://kaggle2.blob.core.windows.net/competitions-data/kaggle/3136/test.csv?sv=2015-12-11&sr=b&sig=cD%2BWsR6UgfAdMWvjquCBnQCYzVgJqDvL85fXpngwUko%3D&se=2016-12-14T00%3A56%3A33Z&sp=r"
+testfile <- "./data/test.csv"
+
+##Download 
+#download.file(trainURL,trainfile)
+#download.file(testURL,testfile)
+
+##Read
+trainData <- read.csv(trainfile, na.strings = c("", " "), stringsAsFactors = FALSE)
+testData <- read.csv(testfile, na.strings = c("", " "), stringsAsFactors = FALSE)
+
+##Combine test and train data for initial exploration and imputation.
+allData <- bind_rows(trainData, testData)
+```
+<br>
+
+##Data Cleaning
+<br>
+
+For reference here is the information about the data provided by the challenge
+<br>
+
+|Variable | Description|
+|---------|------------|
+|survival | Survival   
+|	  | (0 = No; 1 = Yes) 
+|pclass   | Passenger Class 
+|         | (1 = 1st; 2 = 2nd; 3 = 3rd)
+|name     | Name
+|sex      | Sex
+|age      | Age
+|sibsp    | Number of Siblings/Spouses Aboard
+|parch    | Number of Parents/Children Aboard
+|ticket   | Ticket Number
+|fare     | Passenger Fare
+|cabin    | Cabin
+|embarked | Port of Embarkation
+|         | (C = Cherbourg; Q = Queenstown; S = Southampton)
+
+SPECIAL NOTES:
+Pclass is a proxy for socio-economic status (SES)
+ 1st ~ Upper; 2nd ~ Middle; 3rd ~ Lower
+
+Age is in Years; Fractional if Age less than One (1)
+ If the Age is Estimated, it is in the form xx.5
+
+With respect to the family relation variables (i.e. sibsp and parch)
+some relations were ignored.  The following are the definitions used
+for sibsp and parch.
+
+Sibling:  Brother, Sister, Stepbrother, or Stepsister of Passenger Aboard Titanic
+Spouse:   Husband or Wife of Passenger Aboard Titanic (Mistresses and Fiances Ignored)
+Parent:   Mother or Father of Passenger Aboard Titanic
+Child:    Son, Daughter, Stepson, or Stepdaughter of Passenger Aboard Titanic
+
+Other family relatives excluded from this study include cousins,
+nephews/nieces, aunts/uncles, and in-laws.  Some children travelled
+only with a nanny, therefore parch=0 for them.  As well, some
+travelled with very close friends or neighbors in a village, however,
+the definitions do not support such relations.
+
+***
+
+
+#####Then we take a first look
+```{r}
+str(allData)
+```
+<br>
+
+Might be helpful to split out the Last Name and Title from the name column.  Let's try it.
+
+```{r}
+allData <- allData %>% 
+	mutate(lastname = gsub('(.*),.*','\\1',Name)) %>%
+	mutate(title = gsub('.*, (\\w+).\\s.*','\\1',Name))
+
+table(allData$title)
+```
+
+So there is likely not much information in the title.  It mostly shows male/female distinction and age which we already have.  There are a few unique titles but there aren't enough in each category to be valuable.  Last name could provide some information as it could link people together in families.  
+
+Let's look for NA values
+```{r}
+sapply(allData, function(x) sum(is.na(x)))
+```
+
+So let's take a look at the missing fair.
+```{r}
+subset(allData, is.na(Fare))
+```
+
+Let's set the fare to to the average fair for Plcass of 3 and call it done.  
+```{r}
+p3Fares <- subset(allData, Pclass==3)
+allData[1044,"Fare"] <- mean(p3Fares$Fare, na.rm = TRUE)
+```
+
+
+The ages will take something more with 263 missing values.  Maybe we should not use this feature at all.  263/1309 is 21% missing I think I'm going to exclude this feature for now.  
+
+
+Looking at the cabin info it's letter and numeric probably indicating deck and room number.  There are 1014 missing values so this is not going to be of value.
+
+Ticket numbers are all over the place and I don't see it really having much value for prediction.  
+
+Embarked has a few missing values
+```{r}
+sapply(allData, function(x) sum(is.na(x)))
+```
+
+I decide to just exclude these 2 rows for now.
+
+```{r}
+allData <- allData %>% filter(!is.na(Embarked))
+```
+
+
+
+
+So after looking at all the variables I'm going to use Pclass, lastname, SibSp, Parch, title, Fare, Sex, Embarked as they all may have some information and are complete to build a random forest model and see how it does.   
+
+#####Factorizing variables
+```{r}
+allData$Survived <- as.factor(allData$Survived)
+allData$Pclass <- as.factor(allData$Pclass)
+allData$Sex <- as.factor(allData$Sex)
+allData$title <- as.factor(allData$title)
+allData$lastname <- as.factor(allData$lastname)
+
+```
+
+
+####Seperating out factors
+
+Now I'll seperate out the factors I've decided to use and then resplit the data into train and test sets.  
+
+```{r}
+factorsToUse <- c("PassengerId", "Survived", "Pclass", "Sex", "SibSp", "Parch", "Fare", "Embarked", "lastname") 
+	
+allDataSF <- allData %>% select(one_of(factorsToUse))
+titanicTest <-  allDataSF %>% filter(is.na(Survived))
+titanicTrain <- allDataSF %>% filter(!is.na(Survived)) %>% select(-PassengerId)
+```
+
+
+##Building a model
+
+####Parallel processing
+```{r, message=FALSE, warning=FALSE}
+## Set up parallel processing
+cluster <- makeCluster(detectCores() - 1) 
+registerDoParallel(cluster)
+```
+
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(42)
+
+rf_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, allowParallel=TRUE)
+rf_tunegrid <- expand.grid(.mtry=c(6:12))
+
+model_rf <- train(Survived ~ , data=titanicTrain, method='rf', preProcess = c("center", "scale"), trControl = rf_ctrl)
+```
+
+
