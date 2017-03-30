@@ -15,6 +15,7 @@ library(mice)
 library(dplyr)
 library(ggplot2)
 library(caret)
+library(caretEnsemble)
 library(parallel)
 library(doParallel)
 ```
@@ -128,7 +129,17 @@ allData[1044,"Fare"] <- mean(p3Fares$Fare, na.rm = TRUE)
 ```
 
 
-The ages will take something more with 263 missing values.  Maybe we should not use this feature at all.  263/1309 is 21% missing I think I'm going to exclude this feature for now.  
+The ages will take something more with 263 missing values.  21% missing is a lot but let's try and impute the missing values.
+```{r}
+##Select the data we want to use for imputation. 
+vars <- c("Pclass", "Sex", "SibSp", "Parch", "Fare", "Embarked", "Age")
+allDataMice <- allData %>% select(one_of(vars)) 
+mice_out <- mice(allDataMice)
+mice_values <- complete(mice_out)
+
+allData$Age <- mice_values$Age
+```
+
 
 
 Looking at the cabin info it's letter and numeric probably indicating deck and room number.  There are 1014 missing values so this is not going to be of value.
@@ -140,24 +151,43 @@ Embarked has a few missing values
 sapply(allData, function(x) sum(is.na(x)))
 ```
 
-I decide to just exclude these 2 rows for now.
+Let's take a look at these and see what we can do.
 
 ```{r}
-allData <- allData %>% filter(!is.na(Embarked))
+allData %>% filter(is.na(Embarked))
+#allData <- allData %>% filter(!is.na(Embarked))
+```
+
+Let's see where other passengers in their class embarked.
+```{r}
+table(allData %>% filter(Pclass==1) %>% select(Embarked))
+
+```
+Let's call them both S since that's where the majority come from
+
+```{r}
+allData[62,"Embarked"] <- "S"
+allData[830,"Embarked"] <- "S"
 ```
 
 
 
-
-So after looking at all the variables I'm going to use Pclass, lastname, SibSp, Parch, title, Fare, Sex, Embarked as they all may have some information and are complete to build a random forest model and see how it does.   
+So after looking at all the variables I'm going to use Pclass, SibSp, Parch, title, Fare, Sex, Embarked as they all may have some information and are complete to build a random forest model and see how it does.   
 
 #####Factorizing variables
 ```{r}
+##Factorizing
 allData$Survived <- as.factor(allData$Survived)
 allData$Pclass <- as.factor(allData$Pclass)
 allData$Sex <- as.factor(allData$Sex)
 allData$title <- as.factor(allData$title)
-allData$lastname <- as.factor(allData$lastname)
+allData$Embarked <- as.factor(allData$Embarked)
+#allData$Parch <- as.factor(allData$Parch)
+#allData$SibSp <- as.factor(allData$SibSp)
+
+##Adding some valid factor labels
+levels(allData$Pclass) <- c("First","Second","Third")
+levels(allData$Survived) <- c("Perished","Survived")
 
 ```
 
@@ -167,7 +197,7 @@ allData$lastname <- as.factor(allData$lastname)
 Now I'll seperate out the factors I've decided to use and then resplit the data into train and test sets.  
 
 ```{r}
-factorsToUse <- c("PassengerId", "Survived", "Pclass", "Sex", "SibSp", "Parch", "Fare", "Embarked", "lastname") 
+factorsToUse <- c("PassengerId", "Survived", "Pclass", "Sex", "SibSp", "Parch", "Fare", "Embarked", "Age") 
 	
 allDataSF <- allData %>% select(one_of(factorsToUse))
 titanicTest <-  allDataSF %>% filter(is.na(Survived))
@@ -184,15 +214,88 @@ cluster <- makeCluster(detectCores() - 1)
 registerDoParallel(cluster)
 ```
 
-
+####Build model
 ```{r, cache=TRUE, message=FALSE, warning=FALSE}
 
 set.seed(42)
 
-rf_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, allowParallel=TRUE)
-rf_tunegrid <- expand.grid(.mtry=c(6:12))
+rf_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5, allowParallel=TRUE)
+rf_tunegrid <- expand.grid(.mtry=c(1:6))
 
-model_rf <- train(Survived ~ , data=titanicTrain, method='rf', preProcess = c("center", "scale"), trControl = rf_ctrl)
+model_rf <- train(Survived ~ . , data=titanicTrain, method='rf', preProcess = c("center", "scale"), trControl = rf_ctrl, tuneGrid = rf_tunegrid)
 ```
 
+####Make Predictions
+
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+titanicPredictions_rf <- predict(model_rf,newdata=titanicTest)
+titanicSubmission_rf <- data_frame(PassengerID = titanicTest$PassengerId, Survived = as.numeric(titanicPredictions_rf)-1)
+write.csv(titanicSubmission_rf, file = "titanicSubmission_rf.csv", row.names = FALSE)
+```
+
+####Build another model
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(42)
+
+svm_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5, allowParallel=TRUE)
+model_svm <- train(Survived ~ . , data=titanicTrain, method='svmRadial', preProcess = c("center", "scale"), trControl = svm_ctrl, tuneLength = 15 )
+```
+
+####Make Predictions with it.
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+titanicPredictions_svm <- predict(model_svm,newdata=titanicTest)
+titanicSubmission_svm <- data_frame(PassengerID = titanicTest$PassengerId, Survived = as.numeric(titanicPredictions_svm)-1)
+write.csv(titanicSubmission, file = "titanicSubmission_svm.csv", row.names = FALSE)
+```
+
+####Build another model
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(42)
+
+xgbLinear_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5, allowParallel=TRUE)
+model_xgbLinear <- train(Survived ~ . , data=titanicTrain, method='xgbLinear', preProcess = c("center", "scale"), trControl = xgbLinear_ctrl)
+```
+####Make Predictions with it.
+
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+titanicPredictions_xgblinear <- predict(model_xgbLinear,newdata=titanicTest)
+titanicSubmission_xgblinear <- data_frame(PassengerID = titanicTest$PassengerId, Survived = as.numeric(titanicPredictions_xgblinear)-1)
+write.csv(titanicSubmission, file = "titanicSubmission_xgblinear.csv", row.names = FALSE)
+```
+
+
+####Try combining the models
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+set.seed(42)
+##Tuning
+stacked_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5, allowParallel=TRUE, classProbs=TRUE)
+
+##Build Models
+models <- caretList(Survived ~ . , data=titanicTrain, trControl = stacked_ctrl,
+			   tuneList = list(
+			   	rf=caretModelSpec(method='rf', tuneGrid=rf_tunegrid),
+			   	svmRadial=caretModelSpec(method='svmRadial', tuneLength=15),
+			   	xgbLinear=caretModelSpec(method='xgbLinear')
+			   ))
+##Combine them
+stacked_tunegrid <- expand.grid(.mtry=c(1:6))
+models_stacked <- caretStack(models, method="rf", metric="Accuracy", trControl=stacked_ctrl, tuneGrid=stacked_tunegrid)
+
+```
+
+
+####Make predictions with the stacked model
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+titanicPredictions_stacked <- predict(models_stacked,newdata=titanicTest)
+titanicSubmission_stacked <- data_frame(PassengerID = titanicTest$PassengerId, Survived = as.numeric(titanicPredictions_stacked)-1)
+write.csv(titanicSubmission, file = "titanicSubmission_stacked.csv", row.names = FALSE)
+```
+
+```{r}
+
+```
 
